@@ -9,7 +9,7 @@ import torch.nn.functional as F
 import torchvision.transforms as transforms
 import torchvision
 from sklearn.preprocessing import MinMaxScaler
-from data_util import *  # Ensure get_augmentation_pipeline() and other helpers are defined here.
+from data_util_2 import *  # Ensure get_augmentation_pipeline() and other helpers are defined here.
 from omegaconf import OmegaConf
 from BugNet import *
 import models
@@ -20,6 +20,60 @@ from sklearn.utils.class_weight import compute_class_weight
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import ParameterGrid
+from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+from sklearn.manifold import TSNE
+
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+def plot_trc(trc_values, label='Model', color='blue'):
+    ranks = np.arange(1, len(trc_values) + 1)
+    
+    plt.figure(figsize=(8, 5))
+    plt.plot(ranks, trc_values, marker='o', markersize=1, linestyle='-', color=color, label=label)
+    plt.xlabel('Rank')
+    plt.ylabel('TRC Value')
+    plt.title('TRC Curve')
+    plt.grid(True)
+    plt.legend()
+    plt.savefig(f"trc_curve2_{label}.png", dpi=300, bbox_inches='tight')
+    plt.show()
+
+
+
+def debug_features(features, labels):
+    df = pd.DataFrame(features, columns=[
+        'std_label', 
+        'avg_info', 
+        # 'std_info',
+        'max_diff', 
+        # 'avg_pro_diff',
+        # 'kl_div', 
+        'agreement', 
+        'margin', 
+        'mutual_info'
+    ])
+    df['label'] = labels
+
+    # Variance
+    print("\n🔍 Feature Variance:")
+    print(df.var())
+
+    # Correlation heatmap
+    print("\n📈 Correlation Matrix:")
+    corr = df.drop(columns='label').corr()
+    sns.heatmap(corr, annot=True, cmap='coolwarm')
+    plt.title("Feature Correlation Matrix")
+    plt.show()
+
+    # Class-wise mean
+    print("\n📊 Class-wise Means:")
+    print(df.groupby('label').mean())
+
 
 conf = OmegaConf.load('config.yaml')
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -28,10 +82,11 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 def calculate_info_entropy_from_probs(probs):
     return -np.sum(probs * np.log2(probs + 1e-12))  # Avoid log(0)
 
+
 def forward_with_augmentations(net, sample, num_aug=conf.augs):
     if isinstance(sample, torch.Tensor):
         sample = transforms.ToPILImage()(sample.cpu())
-    aug_pipeline = get_augmentation_pipeline()  # Defined in data_util.py
+    aug_pipeline = get_augmentation_pipeline()  
     prob_list, label_list, uncertainty_list = [], [], []
     net.eval()
     with torch.no_grad():
@@ -104,6 +159,25 @@ def calculate_agreement(labels):
         agreement_scores.append(agreement)
     return np.array(agreement_scores)
 
+def calculate_margin(pros):
+    # Difference between top-1 and top-2 class probabilities
+    margins = []
+    for p in pros:
+        top2 = np.partition(p[-1], -2)[-2:]  # last row is reference
+        margins.append(top2[-1] - top2[-2])
+    return np.array(margins)
+
+def calculate_mutual_information(pros):
+    # MI = H(mean_p) - mean(H(p))
+    eps = 1e-12
+    mean_p = np.mean(pros, axis=1)
+    entropy_mean = -np.sum(mean_p * np.log2(mean_p + eps), axis=1)
+
+    entropy_per = -np.sum(pros * np.log2(pros + eps), axis=2)
+    mean_entropy = np.mean(entropy_per, axis=1)
+
+    return entropy_mean - mean_entropy
+
 
 def extract_features(pros, labels, infos):
     avg_p_diff = calculate_avg_pro_diff(pros)
@@ -113,10 +187,24 @@ def extract_features(pros, labels, infos):
     max_diff_num = get_num_of_most_diff_class(labels)
     kl_divs = calculate_kl_divergence(pros)
     agreements = calculate_agreement(labels)
+    margins = calculate_margin(pros)
+    mutual_infos = calculate_mutual_information(pros)
+
+    feature = np.column_stack((
+        std_label, 
+        avg_info, 
+        # std_info, 
+        max_diff_num, 
+        # avg_p_diff, 
+        # kl_divs, 
+        agreements, 
+        margins, 
+        mutual_infos
+    ))
     
-    feature = np.column_stack((std_label, avg_info, std_info, max_diff_num, avg_p_diff, kl_divs, agreements))
     scaler = MinMaxScaler()
     return scaler.fit_transform(feature)
+
 
 def calculate_info_entropy(pros):
     entropys = []
@@ -146,10 +234,8 @@ def test(net, testloader):
                 incorrect_indices = (batch_idx * testloader.batch_size) + torch.nonzero(incorrect_mask).view(-1)
                 error_index.extend(incorrect_indices.tolist())
     acc = 100. * correct / total
-    print(f"\n🧪 Final Test Accuracy: {acc:.2f}%")
+    # print(f"\n🧪 Final Test Accuracy: {acc:.2f}%")
     return np.array(pros), np.array(labels), np.array(infos), np.array(error_index)
-
-import torch
 
 def train(net, num_epochs, optimizer, criterion, trainloader, device):
     net.to(device)
@@ -183,7 +269,7 @@ def train(net, num_epochs, optimizer, criterion, trainloader, device):
         avg_loss = running_loss / len(trainloader)
         scheduler.step()  # Step the scheduler after each epoch
 
-        print(f"✅ Epoch {epoch + 1}: Loss: {avg_loss:.4f}, Accuracy: {epoch_acc:.2f}%")
+        print(f"Epoch {epoch + 1}: Loss: {avg_loss:.4f}, Accuracy: {epoch_acc:.2f}%")
         
 
 def compute_class_weights(y_train_tensor, device):
@@ -191,35 +277,81 @@ def compute_class_weights(y_train_tensor, device):
     weights = compute_class_weight(class_weight='balanced', classes=np.unique(y_train_np), y=y_train_np)
     return torch.tensor(weights, dtype=torch.float32).to(device)
 
+from sklearn.model_selection import RandomizedSearchCV
+
+def run_rf_random_search(X_train, y_train, X_test, test_error_index):
+    test_flags = np.zeros(len(X_test))
+    test_flags[test_error_index] = 1
+
+    param_grid = {
+        "n_estimators": [10, 100, 200, 500, 1000, 1200],
+        "max_depth": [None, 5, 10, 20, 30],
+        "max_features": ["auto", "sqrt"],
+        "min_samples_split": [2, 4, 6],
+        "min_samples_leaf": [1, 2, 4],
+        "class_weight": ["balanced", None],
+    }
+
+    clf = RandomForestClassifier(n_jobs=-1, class_weight='balanced', random_state=42)
+    rs_clf = RandomizedSearchCV(
+        estimator=clf,
+        param_distributions=param_grid,
+        n_iter=30,
+        cv=5,
+        verbose=2,
+        n_jobs=-1,
+        random_state=42
+    )
+    rs_clf.fit(X_train, y_train)
+
+    # Predict probabilities
+    scores = rs_clf.predict_proba(X_test)[:, 1]  # probability of class 1 (bug)
+    ranking = np.argsort(scores)[::-1]
+    sorted_flags = test_flags[ranking]
+
+    rauc_100 = rauc(sorted_flags, 100)
+    rauc_200 = rauc(sorted_flags, 200)
+    rauc_500 = rauc(sorted_flags, 500)
+    rauc_1000 = rauc(sorted_flags, 1000)
+    rauc_all = rauc(sorted_flags, len(test_flags))
+    atrc_val = ATRC(sorted_flags, int(np.sum(test_flags)))
+    print("Best parameters found:", rs_clf.best_params_)
+    print("Number of bug samples in top 100:", np.sum(sorted_flags[:100]))
+    print("Number of bug samples in top 500:", np.sum(sorted_flags[:500]))
+
+
+    return rauc_100, rauc_200, rauc_500, rauc_1000, rauc_all, atrc_val
+
+
 def run_rf_grid(X_train, y_train, X_test, test_error_index):
     test_flags = np.zeros(len(X_test))
     test_flags[test_error_index] = 1
 
     results = []
-    grid = ParameterGrid({
-        'n_estimators': [50, 100],
-        'max_depth': [4, 8, None]
-    })
+    # grid = ParameterGrid({
+    #     'n_estimators': [50, 100],
+    #     'max_depth': [4, 8, None]
+    # })
 
-    for params in grid:
-        model = RandomForestClassifier(n_estimators=params['n_estimators'],
-                                       max_depth=params['max_depth'],
-                                       class_weight='balanced')
-        model.fit(X_train, y_train)
-        scores = model.predict_proba(X_test)[:, 1]
-        ranking = np.argsort(scores)[::-1]
-        sorted_flags = test_flags[ranking]
+    # for params in grid:
+    model = RandomForestClassifier(n_estimators=50,
+                                      max_depth=None,
+                                      class_weight='balanced')
+    model.fit(X_train, y_train)
+    scores = model.predict_proba(X_test)[:, 1]
+    ranking = np.argsort(scores)[::-1]
+    sorted_flags = test_flags[ranking]
 
-        rauc_100 = rauc(sorted_flags, 100)
-        rauc_200 = rauc(sorted_flags, 200)
-        rauc_500 = rauc(sorted_flags, 500)
-        rauc_1000 = rauc(sorted_flags, 1000)
-        rauc_all = rauc(sorted_flags, len(test_flags))
-        atrc_val, _ = ATRC(sorted_flags, int(np.sum(test_flags)))
-        results.append((params, rauc_100, rauc_200, rauc_500, rauc_1000, rauc_all, atrc_val))
+    rauc_100 = rauc(sorted_flags, 100)
+    rauc_200 = rauc(sorted_flags, 200)
+    rauc_500 = rauc(sorted_flags, 500)
+    rauc_1000 = rauc(sorted_flags, 1000)
+    rauc_all = rauc(sorted_flags, len(test_flags))
+    atrc_val, trc_values = ATRC(sorted_flags, int(np.sum(test_flags)))
+    plot_trc(trc_values, label='TDPR Model', color='green')
+    results.append((rauc_100, rauc_200, rauc_500, rauc_1000, rauc_all, atrc_val))
 
     return results
-
 
 # --- Main Function ---
 def main():
@@ -235,6 +367,18 @@ def main():
         
     # Train the model.
     train(net, conf.epochs, optimizer, criterion, trainloader, device)
+    # final_model_path = "final_model.pth"
+    # torch.save(net.state_dict(), final_model_path)
+    # state_dict = torch.load(final_model_path, map_location=device)
+    # missing, unexpected = net.load_state_dict(state_dict, strict=False)
+
+    # if missing or unexpected:
+    #     print("⚠️  Mismatch while loading weights")
+    #     print("   • Missing keys:    ", missing)
+    #     print("   • Unexpected keys: ", unexpected)
+
+    # net.eval() 
+
     # Get validation and test DataLoaders.
     valloader, testloader = get_val_and_test(conf.corruption)
     
@@ -252,7 +396,7 @@ def main():
         test_prob_arrays = data['test_prob_arrays']
         test_label_arrays = data['test_label_arrays']
         test_uncertainty_arrays = data['test_uncertainty_arrays']
-        print("Loaded augmented outputs from file.")
+        # print("Loaded augmented outputs from file.")
     else:
         val_prob_arrays, val_label_arrays, val_uncertainty_arrays = generate_augmented_outputs(net, valloader.dataset, num_aug=conf.augs)
         test_prob_arrays, test_label_arrays, test_uncertainty_arrays = generate_augmented_outputs(net, testloader.dataset, num_aug=conf.augs)
@@ -263,32 +407,32 @@ def main():
                  test_prob_arrays=test_prob_arrays,
                  test_label_arrays=test_label_arrays,
                  test_uncertainty_arrays=test_uncertainty_arrays)
-        print("Computed and saved augmented outputs.")
+        # print("Computed and saved augmented outputs.")
     
     # If extracted features exist, load them; otherwise compute and save.
-    if os.path.exists(feat_file):
-        feat_data = np.load(feat_file)
-        val_features = feat_data['val_features']
-        test_features = feat_data['test_features']
-        print("Loaded extracted features from file.")
-    else:
-        val_features = extract_features(val_prob_arrays, val_label_arrays, val_uncertainty_arrays)
-        test_features = extract_features(test_prob_arrays, test_label_arrays, test_uncertainty_arrays)
-        np.savez(feat_file, val_features=val_features, test_features=test_features)
-        print("Computed and saved extracted features.")
+    # if os.path.exists(feat_file):
+    #     feat_data = np.load(feat_file)
+    #     val_features = feat_data['val_features']
+    #     test_features = feat_data['test_features']
+    #     # print("Loaded extracted features from file.")
+    # else:
+    val_features = extract_features(val_prob_arrays, val_label_arrays, val_uncertainty_arrays)
+    test_features = extract_features(test_prob_arrays, test_label_arrays, test_uncertainty_arrays)
+        # np.savez(feat_file, val_features=val_features, test_features=test_features)
+        # print("Computed and saved extracted features.")
     
     # If error indices exist, load them; otherwise compute and save.
     if os.path.exists(err_file):
         err_data = np.load(err_file)
         val_error_index = err_data['val_error_index']
         test_error_index = err_data['test_error_index']
-        print("Loaded error indices from file.")
+        # print("Loaded error indices from file.")
     else:
         _, _, _, val_error_index = test(net, valloader)
         _, _, _, test_error_index = test(net, testloader)
         np.savez(err_file, val_error_index=val_error_index, test_error_index=test_error_index)
-        print("Computed and saved error indices.")
-    
+        # print("Computed and saved error indices.")
+
     print("Extracted validation features shape:", val_features.shape)
     print("Extracted test features shape:", test_features.shape)
     
@@ -296,6 +440,36 @@ def main():
     val_labels = np.zeros(len(valloader.dataset), dtype=int)
     val_labels[val_error_index] = 1
 
+    X_vis = PCA(n_components=2).fit_transform(val_features)
+    plt.scatter(X_vis[:, 0], X_vis[:, 1], c=val_labels, cmap='coolwarm')
+    plt.title("PCA of Validation Features")
+    plt.savefig("pca_val_features.png", dpi=300, bbox_inches='tight')
+
+    X_vis = TSNE(n_components=2, random_state=42).fit_transform(val_features)
+    plt.scatter(X_vis[:, 0], X_vis[:, 1], c=val_labels, cmap='coolwarm')
+    plt.title("t-SNE of Validation Features")
+    plt.savefig("tsne_val_features.png")
+    
+    # Helps you see: are low-confidence predictions scattered randomly, or localized?
+    confidences = np.max(val_prob_arrays[:, -1, :], axis=1)
+    plt.scatter(X_vis[:, 0], X_vis[:, 1], c=confidences, cmap='viridis')
+    plt.colorbar(label='Model Confidence')
+    plt.title("Confidence Distribution in Feature Space")
+    plt.savefig("confidence_distribution.png", dpi=300, bbox_inches='tight')
+    
+    
+    print("val prob arrays",val_prob_arrays[:5])
+    print("val label arrays",val_label_arrays[:20])
+    print("val uncertainty arrays",val_uncertainty_arrays[:5])
+    print("Validation labels:", val_labels)
+    print("Validation error indices:", val_error_index)
+    print("Test error indices:", test_error_index)
+    print("Validation features shape:", val_features.shape)
+    print("Test features shape:", test_features.shape)
+    print(val_features[:5])
+    print(val_labels[:5])
+
+    debug_features(val_features, val_labels)
 
     # Hyperparameter for hidden layer size
     hidden_dim = 64  # You can make this a configurable argument
@@ -314,7 +488,7 @@ def main():
         criterion = nn.BCEWithLogitsLoss(pos_weight=class_weights[1])
         optimizer = optim.Adam(model.parameters(), lr=0.001)
 
-        for epoch in range(50):
+        for epoch in range(200):
             model.train()
             optimizer.zero_grad()
             outputs = model(X_train.to(device))         # Shape: (batch,)
@@ -322,11 +496,12 @@ def main():
             loss.backward()
             optimizer.step()
             # Compute accuracy
-            _, predicted = torch.max(outputs, dim=1)
+            probs = torch.sigmoid(outputs)
+            predicted = (probs >= 0.5).long()
             correct = (predicted == y_train.to(device)).sum().item()
             total = y_train.size(0)
             accuracy = 100.0 * correct / total
-            print(f"Epoch {epoch+1}: Loss = {loss.item():.4f}, Accuracy = {accuracy:.2f}%")
+            # print(f"Epoch {epoch+1}: Loss = {loss.item():.4f}, Accuracy = {accuracy:.2f}%")
 
         model.eval()
         with torch.no_grad():
@@ -346,14 +521,22 @@ def main():
         print("ATRC:", ATRC(sorted_flags, int(np.sum(test_flags))))
 
     elif model_type == "rf":
+        # r100, r200, r500, r1000, rauc_all, atrc = run_rf_random_search(val_features, val_labels, test_features, test_error_index)
+        # print(f"RAUC@100: {r100}")
+        # print(f"RAUC@200: {r200}")
+        # print(f"RAUC@500: {r500}")
+        # print(f"RAUC@1000: {r1000}")
+        # print(f"RAUC@all: {rauc_all}")
+        # print(f"ATRC: {atrc}")
         results = run_rf_grid(val_features, val_labels, test_features, test_error_index)
-        for params, r100, r200, r500, r1000, rauc_all, atrc in results:
-            print(f"[RF {params}] RAUC@100: {r100}")
-            print(f"[RF {params}] RAUC@200: {r200}")
-            print(f"[RF {params}] RAUC@500: {r500}")
-            print(f"[RF {params}] RAUC@1000: {r1000}")
-            print(f"[RF {params}] RAUC@all: {rauc_all}")
-            print(f"[RF {params}] ATRC: {atrc}")
+        for r100, r200, r500, r1000, rauc_all, atrc in results:
+            print(f"RAUC@100: {r100}")
+            print(f"RAUC@200: {r200}")
+            print(f"RAUC@500: {r500}")
+            print(f"RAUC@1000: {r1000}")
+            print(f"RAUC@all: {rauc_all}")
+            print(f"ATRC: {atrc}")
+
                   
 
 
